@@ -1,0 +1,189 @@
+import * as p from '@clack/prompts';
+import pc from 'picocolors';
+import { getApiKey } from '../lib/config.js';
+import { PicaApi, TimeoutError } from '../lib/api.js';
+import { openConnectionPage, getConnectionUrl } from '../lib/browser.js';
+import { findPlatform, findSimilarPlatforms } from '../lib/platforms.js';
+import type { Connection } from '../lib/types.js';
+
+export async function connectionAddCommand(platformArg?: string): Promise<void> {
+  p.intro(pc.bgCyan(pc.black(' Pica ')));
+
+  const apiKey = getApiKey();
+  if (!apiKey) {
+    p.cancel('Not configured. Run `pica init` first.');
+    process.exit(1);
+  }
+
+  const api = new PicaApi(apiKey);
+
+  // Get platform list for validation
+  const spinner = p.spinner();
+  spinner.start('Loading platforms...');
+
+  let platforms;
+  try {
+    platforms = await api.listPlatforms();
+    spinner.stop(`${platforms.length} platforms available`);
+  } catch (error) {
+    spinner.stop('Failed to load platforms');
+    p.cancel(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    process.exit(1);
+  }
+
+  // Get or prompt for platform
+  let platform: string;
+
+  if (platformArg) {
+    const found = findPlatform(platforms, platformArg);
+    if (found) {
+      platform = found.platform;
+    } else {
+      const similar = findSimilarPlatforms(platforms, platformArg);
+      if (similar.length > 0) {
+        p.log.warn(`Unknown platform: ${platformArg}`);
+        const suggestion = await p.select({
+          message: 'Did you mean:',
+          options: [
+            ...similar.map(s => ({ value: s.platform, label: `${s.name} (${s.platform})` })),
+            { value: '__other__', label: 'None of these' },
+          ],
+        });
+
+        if (p.isCancel(suggestion) || suggestion === '__other__') {
+          p.note(`Run ${pc.cyan('pica platforms')} to see all available platforms.`);
+          p.cancel('Connection cancelled.');
+          process.exit(0);
+        }
+
+        platform = suggestion as string;
+      } else {
+        p.cancel(`Unknown platform: ${platformArg}\n\nRun ${pc.cyan('pica platforms')} to see available platforms.`);
+        process.exit(1);
+      }
+    }
+  } else {
+    const platformInput = await p.text({
+      message: 'Which platform do you want to connect?',
+      placeholder: 'gmail, slack, hubspot...',
+      validate: (value) => {
+        if (!value.trim()) return 'Platform name is required';
+        return undefined;
+      },
+    });
+
+    if (p.isCancel(platformInput)) {
+      p.cancel('Connection cancelled.');
+      process.exit(0);
+    }
+
+    const found = findPlatform(platforms, platformInput);
+    if (found) {
+      platform = found.platform;
+    } else {
+      p.cancel(`Unknown platform: ${platformInput}\n\nRun ${pc.cyan('pica platforms')} to see available platforms.`);
+      process.exit(1);
+    }
+  }
+
+  // Open browser
+  const url = getConnectionUrl(platform);
+  p.log.info(`Opening browser to connect ${pc.cyan(platform)}...`);
+  p.note(pc.dim(url), 'URL');
+
+  try {
+    await openConnectionPage(platform);
+  } catch {
+    p.log.warn('Could not open browser automatically.');
+    p.note(`Open this URL manually:\n${url}`);
+  }
+
+  // Poll for connection
+  const pollSpinner = p.spinner();
+  pollSpinner.start('Waiting for connection... (complete auth in browser)');
+
+  try {
+    const connection = await api.waitForConnection(platform, 5 * 60 * 1000, 5000);
+    pollSpinner.stop(`${platform} connected!`);
+
+    p.log.success(`${pc.green('✓')} ${connection.platform} is now available to your AI agents.`);
+    p.outro('Connection complete!');
+  } catch (error) {
+    pollSpinner.stop('Connection timed out');
+
+    if (error instanceof TimeoutError) {
+      p.note(
+        `Possible issues:\n` +
+        `  - OAuth flow was not completed in the browser\n` +
+        `  - Browser popup was blocked\n` +
+        `  - Wrong account selected\n\n` +
+        `Try again with: ${pc.cyan(`pica connection add ${platform}`)}`,
+        'Timed Out'
+      );
+    } else {
+      p.log.error(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+
+    process.exit(1);
+  }
+}
+
+export async function connectionListCommand(): Promise<void> {
+  const apiKey = getApiKey();
+  if (!apiKey) {
+    p.cancel('Not configured. Run `pica init` first.');
+    process.exit(1);
+  }
+
+  const api = new PicaApi(apiKey);
+
+  const spinner = p.spinner();
+  spinner.start('Loading connections...');
+
+  try {
+    const connections = await api.listConnections();
+    spinner.stop(`${connections.length} connection${connections.length === 1 ? '' : 's'} found`);
+
+    if (connections.length === 0) {
+      p.note(
+        `No connections yet.\n\n` +
+        `Add one with: ${pc.cyan('pica connection add gmail')}`,
+        'No Connections'
+      );
+      return;
+    }
+
+    console.log();
+    console.log(pc.bold('  Your Connections'));
+    console.log();
+
+    const maxPlatformLen = Math.max(...connections.map(c => c.platform.length));
+
+    for (const conn of connections) {
+      const status = getStatusIndicator(conn.state);
+      const platform = conn.platform.padEnd(maxPlatformLen);
+      console.log(`  ${status} ${platform}  ${pc.dim(conn.state)}`);
+      console.log(`    ${pc.dim(conn.key)}`);
+    }
+
+    console.log();
+    p.note(`Add more with: ${pc.cyan('pica connection add <platform>')}`, 'Tip');
+  } catch (error) {
+    spinner.stop('Failed to load connections');
+    p.cancel(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    process.exit(1);
+  }
+}
+
+function getStatusIndicator(state: Connection['state']): string {
+  switch (state) {
+    case 'operational':
+      return pc.green('●');
+    case 'degraded':
+      return pc.yellow('●');
+    case 'failed':
+      return pc.red('●');
+    default:
+      return pc.dim('○');
+  }
+}
